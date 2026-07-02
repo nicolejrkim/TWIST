@@ -149,6 +149,12 @@ def main(args, xml_file, robot_base):
             mimic_obs_list = mimic_obs.tolist() if mimic_obs.ndim == 1 else mimic_obs.flatten().tolist()
             redis_client.set(f"action_mimic_{args.robot}", json.dumps(mimic_obs_list))
             redis_client.set(f"action_hand_{args.robot}", json.dumps(DEFAULT_ACTION_HAND[args.robot].tolist()))
+            # extension: publish the reference planar pose (x, y, yaw) in the motion-file
+            # frame so a low-level controller with localization can close the global
+            # tracking loop (see --kp_recovery in server_low_level_g1_sim.py)
+            ref_xy = root_pos[:2] if root_pos.ndim == 1 else root_pos[0, :2]
+            redis_client.set(f"ref_root_pose_{args.robot}",
+                             json.dumps([float(ref_xy[0]), float(ref_xy[1]), float(mimic_obs[3])]))
             last_mimic_obs = mimic_obs
             # Print or log it
             print(f"Step {t_step:4d} => mimic_obs shape = {mimic_obs.shape} published...", end="\r")
@@ -174,6 +180,8 @@ def main(args, xml_file, robot_base):
         
     except KeyboardInterrupt:
         print("[Motion Server] Keyboard interrupt. Interpolating to default mimic_obs...")
+        # stop global recovery corrections (low-level re-anchors on the next run)
+        redis_client.delete(f"ref_root_pose_{args.robot}")
         # do linear interpolation to the last mimic_obs
         time_back_to_default = 2.0
         for i in range(int(time_back_to_default / control_dt)):
@@ -187,6 +195,8 @@ def main(args, xml_file, robot_base):
         exit()
     finally:
         print("[Motion Server] Exiting...Interpolating to default mimic_obs...")
+        # stop global recovery corrections (low-level re-anchors on the next run)
+        redis_client.delete(f"ref_root_pose_{args.robot}")
         # do linear interpolation to the last mimic_obs
         time_back_to_default = 2.0
         for i in range(int(time_back_to_default / control_dt)):
