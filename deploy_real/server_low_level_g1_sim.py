@@ -78,6 +78,8 @@ class RealTimePolicyController:
                  record_video=False,
                  kp_recovery=0.0,
                  kp_yaw_recovery=0.0,
+                 kd_recovery=0.0,
+                 kd_yaw_recovery=0.0,
                  max_recovery_vel=0.5,
                  max_recovery_yaw_rate=1.0):
 
@@ -85,11 +87,18 @@ class RealTimePolicyController:
         # injected through the mimic obs velocity / yaw-rate channels)
         self.kp_recovery = kp_recovery
         self.kp_yaw_recovery = kp_yaw_recovery
+        self.kd_recovery = kd_recovery
+        self.kd_yaw_recovery = kd_yaw_recovery
         self.max_recovery_vel = max_recovery_vel
         self.max_recovery_yaw_rate = max_recovery_yaw_rate
+        self.recovery_active = (kp_recovery > 0 or kp_yaw_recovery > 0
+                                or kd_recovery > 0 or kd_yaw_recovery > 0)
         self.recovery_anchor = None  # SE(2) transform: motion-file frame -> sim world
-        if self.kp_recovery > 0 or self.kp_yaw_recovery > 0:
+        self.recovery_prev_err = None  # (t, err_xy, yaw_err) for the D term
+        self.recovery_err_dot = np.zeros(3)  # EMA-filtered [ex_dot, ey_dot, eyaw_dot]
+        if self.recovery_active:
             print(f"[Recovery] global recovery ON: kp_pos={kp_recovery}, kp_yaw={kp_yaw_recovery}, "
+                  f"kd_pos={kd_recovery}, kd_yaw={kd_yaw_recovery}, "
                   f"max_vel={max_recovery_vel}, max_yaw_rate={max_recovery_yaw_rate}")
 
         self.redis_client = None
@@ -226,7 +235,7 @@ class RealTimePolicyController:
         ang_vel = self.data.sensor('angular-velocity').data.astype(np.float32)
         return whole_body_dof, whole_body_dof_vel, body_dof_pos, body_dof_vel, wrist_dof_pos, wrist_dof_vel, quat, ang_vel
 
-    def _apply_global_recovery(self, action_mimic, robot_yaw):
+    def _apply_global_recovery(self, action_mimic, robot_yaw, t_sim):
         """Bias the mimic velocity command with Kp feedback on the global pose error.
 
         Reads the reference planar pose (motion-file frame) published by the motion
@@ -238,6 +247,8 @@ class RealTimePolicyController:
         ref_pose_json = self.redis_client.get("ref_root_pose_g1")
         if ref_pose_json is None:
             self.recovery_anchor = None  # motion server idle/restarted -> re-anchor later
+            self.recovery_prev_err = None
+            self.recovery_err_dot = np.zeros(3)
             return action_mimic
 
         ref_x, ref_y, ref_yaw = json.loads(ref_pose_json)
@@ -255,13 +266,29 @@ class RealTimePolicyController:
         target_xy = robot_xy0 + rot @ (ref_xy - ref_xy0)
         target_yaw = ref_yaw + dyaw
 
-        vel_corr_world = np.clip(self.kp_recovery * (target_xy - robot_xy),
+        err_xy = target_xy - robot_xy
+        yaw_err = wrap_to_pi(target_yaw - robot_yaw)
+
+        # D term: finite-difference the error between control steps, EMA-filtered
+        if self.recovery_prev_err is not None:
+            prev_t, prev_err_xy, prev_yaw_err = self.recovery_prev_err
+            dt = t_sim - prev_t
+            if dt > 0:
+                raw_dot = np.array([(err_xy[0] - prev_err_xy[0]) / dt,
+                                    (err_xy[1] - prev_err_xy[1]) / dt,
+                                    wrap_to_pi(yaw_err - prev_yaw_err) / dt])
+                self.recovery_err_dot = 0.5 * raw_dot + 0.5 * self.recovery_err_dot
+        self.recovery_prev_err = (t_sim, err_xy.copy(), yaw_err)
+
+        vel_corr_world = np.clip(self.kp_recovery * err_xy
+                                 + self.kd_recovery * self.recovery_err_dot[:2],
                                  -self.max_recovery_vel, self.max_recovery_vel)
         # express in the reference-local frame, matching the mimic obs convention
         ct, st = np.cos(target_yaw), np.sin(target_yaw)
         vel_corr_local = np.array([ct * vel_corr_world[0] + st * vel_corr_world[1],
                                    -st * vel_corr_world[0] + ct * vel_corr_world[1]])
-        yaw_rate_corr = np.clip(self.kp_yaw_recovery * wrap_to_pi(target_yaw - robot_yaw),
+        yaw_rate_corr = np.clip(self.kp_yaw_recovery * yaw_err
+                                + self.kd_yaw_recovery * self.recovery_err_dot[2],
                                 -self.max_recovery_yaw_rate, self.max_recovery_yaw_rate)
 
         action_mimic = action_mimic.copy()
@@ -327,8 +354,8 @@ class RealTimePolicyController:
                         if action_mimic_json is not None:
                             action_mimic_list = json.loads(action_mimic_json)
                             action_mimic = np.array(action_mimic_list, dtype=np.float32)
-                            if self.kp_recovery > 0 or self.kp_yaw_recovery > 0:
-                                action_mimic = self._apply_global_recovery(action_mimic, rpy[2])
+                            if self.recovery_active:
+                                action_mimic = self._apply_global_recovery(action_mimic, rpy[2], i * self.sim_dt)
                             action_mimic, wrist_dof_pos = extract_mimic_obs_to_body_and_wrist(action_mimic)
                         else:
                             raise Exception("cannot get action mimic from redis")
@@ -391,6 +418,8 @@ def main_low_level_sim(args):
         record_video=args.record_video,
         kp_recovery=args.kp_recovery,
         kp_yaw_recovery=args.kp_yaw_recovery,
+        kd_recovery=args.kd_recovery,
+        kd_yaw_recovery=args.kd_yaw_recovery,
         max_recovery_vel=args.max_recovery_vel,
         max_recovery_yaw_rate=args.max_recovery_yaw_rate,
     )
@@ -414,6 +443,10 @@ if __name__ == "__main__":
                         help="Kp gain on global xy position error, injected via the root velocity command")
     parser.add_argument("--kp_yaw_recovery", type=float, default=0.0,
                         help="Kp gain on heading error, injected via the yaw-rate command")
+    parser.add_argument("--kd_recovery", type=float, default=0.0,
+                        help="Kd gain on the xy error rate (damping for the position correction)")
+    parser.add_argument("--kd_yaw_recovery", type=float, default=0.0,
+                        help="Kd gain on the heading error rate (damping for the yaw correction)")
     parser.add_argument("--max_recovery_vel", type=float, default=0.5,
                         help="cap [m/s] on the corrective linear velocity")
     parser.add_argument("--max_recovery_yaw_rate", type=float, default=1.0,
