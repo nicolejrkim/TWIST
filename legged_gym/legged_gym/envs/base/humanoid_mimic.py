@@ -30,7 +30,11 @@ class HumanoidMimic(HumanoidChar):
         self._ref_char_offset = torch.tensor(cfg.env.ref_char_offset, device=sim_device, dtype=torch.float)
         self._track_root = cfg.env.track_root
         self.global_obs = cfg.env.global_obs
+        self._obs_ref_root_pose = getattr(cfg.env, 'obs_ref_root_pose', False)
+        self._ref_root_pose_err_clip = getattr(cfg.env, 'ref_root_pose_err_clip', 1.0)
+        self._randomize_init_root_pose_err = getattr(cfg.env, 'randomize_init_root_pose_err', False)
         cprint(f"[HumanoidMimic] global_obs: {self.global_obs}")
+        cprint(f"[HumanoidMimic] obs_ref_root_pose: {self._obs_ref_root_pose}")
 
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
         self.last_feet_z = 0.05
@@ -164,6 +168,16 @@ class HumanoidMimic(HumanoidChar):
                 self.root_states[env_ids, :2] += root_pos[env_ids, :2]
             if root_ang_vel is not None:
                 self.root_states[env_ids, 10:13] = root_ang_vel[env_ids, :]
+            if self._randomize_init_root_pose_err:
+                # offset the robot relative to the reference (episode_init_origin is NOT
+                # updated) so episodes start with a genuine root pose error to close
+                xy_err = self.cfg.env.init_root_xy_err_range
+                rand_xy_err = torch_rand_float(-xy_err, xy_err, (len(env_ids), 2), device=self.device)
+                self.root_states[env_ids, :2] += rand_xy_err
+                yaw_err = self.cfg.env.init_root_yaw_err_range
+                rand_yaw_err = torch_rand_float(-yaw_err, yaw_err, (len(env_ids), 1), device=self.device).squeeze(1)
+                yaw_err_quat = quat_from_euler_xyz(0*rand_yaw_err, 0*rand_yaw_err, rand_yaw_err)
+                self.root_states[env_ids, 3:7] = quat_mul(yaw_err_quat, self.root_states[env_ids, 3:7])
         else:
             self.root_states[env_ids] = self.base_init_state
             self.root_states[env_ids, :3] += self.env_origins[env_ids]
@@ -459,7 +473,8 @@ class HumanoidMimic(HumanoidChar):
         return vel_err
     
     def _reward_tracking_root_pose(self):
-        if self.global_obs:
+        if self.global_obs or self._obs_ref_root_pose:
+            # with obs_ref_root_pose the global xy error is observable, so reward closing it
             root_pos_diff = self._ref_root_pos - self.root_states[:, 0:3]
         else:
             root_pos_diff = self._ref_root_pos[:, 2:3] - self.root_states[:, 2:3]

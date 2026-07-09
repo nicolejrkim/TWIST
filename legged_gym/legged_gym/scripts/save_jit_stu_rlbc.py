@@ -71,23 +71,27 @@ def play(args):
     checkpoint = args.checkpoint
     
     history_len = 10
-    
+
+    # policies trained with env.obs_ref_root_pose have 3 extra mimic obs dims
+    # (heading-frame [err_x, err_y, err_yaw]) appended to each mimic obs block
+    n_ref_root_pose_obs = 3 if args.root_pose_obs else 0
+
     if args.robot == "g1":
         num_actions = 23
         n_proprio = 3 + 2 + 3*num_actions
-        n_mimic_obs = 8 + 23
+        n_mimic_obs = 8 + 23 + n_ref_root_pose_obs
         n_obs_single = n_mimic_obs + n_proprio
         num_observations = n_obs_single * (history_len + 1)
     elif args.robot == "t1":
         num_actions = 21
         n_proprio = 3 + 2 + 3*num_actions
-        n_mimic_obs = 8 + 21
+        n_mimic_obs = 8 + 21 + n_ref_root_pose_obs
         n_obs_single = n_mimic_obs + n_proprio
         num_observations = n_obs_single * (history_len + 1)
     elif args.robot == "toddy":
         num_actions = 22
         n_proprio = 3 + 2 + 3*num_actions
-        n_mimic_obs = 8 + 22
+        n_mimic_obs = 8 + 22 + n_ref_root_pose_obs
         n_obs_single = n_mimic_obs + n_proprio
         num_observations = n_obs_single * (history_len + 1)
     else:
@@ -132,6 +136,8 @@ if __name__ == "__main__":
     parser.add_argument('--exptid', type=str)
     parser.add_argument('--checkpoint', type=int, default=-1)
     parser.add_argument('--robot', type=str, default="gr1") # options: gr1, h1, g1
+    parser.add_argument('--root_pose_obs', action='store_true',
+                        help="policy was trained with env.obs_ref_root_pose (3 extra mimic obs dims)")
 
     args = parser.parse_args()
     play(args)

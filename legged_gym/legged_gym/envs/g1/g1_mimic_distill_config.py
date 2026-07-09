@@ -13,10 +13,14 @@ class G1MimicPrivCfg(HumanoidMimicCfg):
         n_priv_latent = 4 + 1 + 2*num_actions
         extra_critic_obs = 3
         n_priv = 0
-        
+
+        obs_ref_root_pose = True
+        n_ref_root_pose_obs = 3 if obs_ref_root_pose else 0 # heading-frame [err_x, err_y, err_yaw]
+        randomize_init_root_pose_err = obs_ref_root_pose
+
         n_proprio = 3 + 2 + 3*num_actions
-        n_priv_mimic_obs = len(tar_obs_steps) * (8 + num_actions + 3*9) # Hardcode for now, 9 is base, 9 is the number of key bodies
-        n_mimic_obs = 8 + 23 # 23 for dof pos
+        n_priv_mimic_obs = len(tar_obs_steps) * (8 + num_actions + 3*9 + n_ref_root_pose_obs) # Hardcode for now, 9 is base, 9 is the number of key bodies
+        n_mimic_obs = 8 + 23 + n_ref_root_pose_obs # 23 for dof pos
         n_priv_info = 3 + 1 + 3*9 + 2 + 4 + 1 + 2*num_actions # base lin vel, root height, key body pos, contact mask, priv latent
         history_len = 10
         
@@ -305,17 +309,21 @@ class G1MimicStuCfg(G1MimicPrivCfg):
         n_priv_latent = 4 + 1 + 2*num_actions
         extra_critic_obs = 3
         n_priv = 0
-        
+
+        obs_ref_root_pose = True
+        n_ref_root_pose_obs = 3 if obs_ref_root_pose else 0 # heading-frame [err_x, err_y, err_yaw]
+        randomize_init_root_pose_err = obs_ref_root_pose
+
         n_proprio = 3 + 2 + 3*num_actions
-        n_priv_mimic_obs = len(tar_obs_steps) * (8 + num_actions + 3*9) # Hardcode for now, 9 is the number of key bodies
-        n_mimic_obs = 8 + 23 # 23 for dof pos
-        
+        n_priv_mimic_obs = len(tar_obs_steps) * (8 + num_actions + 3*9 + n_ref_root_pose_obs) # Hardcode for now, 9 is the number of key bodies
+        n_mimic_obs = 8 + 23 + n_ref_root_pose_obs # 23 for dof pos
+
         n_priv_info = 3 + 1 + 3*9 + 2 + 4 + 1 + 2*num_actions # base lin vel, root height, key body pos, contact mask, priv latent
         history_len = 10
-        
+
         n_obs_single = n_mimic_obs + n_proprio
         n_priv_obs_single = n_priv_mimic_obs + n_proprio + n_priv_info
-        
+
         num_observations = n_obs_single * (history_len + 1)
 
         num_privileged_obs = n_priv_obs_single
@@ -331,21 +339,25 @@ class G1MimicStuRLCfg(G1MimicPrivCfg):
         n_priv_latent = 4 + 1 + 2*num_actions
         extra_critic_obs = 3
         n_priv = 0
-        
+
+        obs_ref_root_pose = True
+        n_ref_root_pose_obs = 3 if obs_ref_root_pose else 0 # heading-frame [err_x, err_y, err_yaw]
+        randomize_init_root_pose_err = obs_ref_root_pose
+
         n_proprio = 3 + 2 + 3*num_actions
-        n_priv_mimic_obs = len(tar_obs_steps) * (8 + num_actions + 3*9) # Hardcode for now, 9 is the number of key bodies
-        n_mimic_obs = 8 + 23 # 23 for dof pos
-        
+        n_priv_mimic_obs = len(tar_obs_steps) * (8 + num_actions + 3*9 + n_ref_root_pose_obs) # Hardcode for now, 9 is the number of key bodies
+        n_mimic_obs = 8 + 23 + n_ref_root_pose_obs # 23 for dof pos
+
         n_priv_info = 3 + 1 + 3*9 + 2 + 4 + 1 + 2*num_actions # base lin vel, root height, key body pos, contact mask, priv latent
         history_len = 10
-        
+
         n_obs_single = n_mimic_obs + n_proprio
         n_priv_obs_single = n_priv_mimic_obs + n_proprio + n_priv_info
-        
+
         num_observations = n_obs_single * (history_len + 1)
 
         num_privileged_obs = n_priv_obs_single
-    
+
     class rewards(HumanoidMimicCfg.rewards):
         regularization_names = [
                         # "feet_stumble",

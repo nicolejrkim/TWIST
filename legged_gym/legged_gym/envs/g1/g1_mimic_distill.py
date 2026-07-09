@@ -230,28 +230,52 @@ class G1MimicDistill(HumanoidMimic):
         root_rot = root_rot.reshape(self.num_envs, num_steps, root_rot.shape[-1])
         root_ang_vel = root_ang_vel.reshape(self.num_envs, num_steps, root_ang_vel.shape[-1])
         dof_pos = dof_pos.reshape(self.num_envs, num_steps, dof_pos.shape[-1])
-     
+
         # teacher v0
-        priv_mimic_obs_buf = torch.cat((
+        priv_mimic_obs_terms = [
             root_pos[..., 2:3], # 1 dim
             roll, pitch, yaw, # 3 dims
             root_vel, # 3 dims
             root_ang_vel[..., 2:3], # 1 dim, yaw only
             dof_pos, # num_dof dims
             whole_key_body_pos, # num_bodies * 3 dims
-        ), dim=-1) # shape: (num_envs, num_steps, 7 + num_dof + num_key_bodies * 3)
-        
-        
+        ] # shape: (num_envs, num_steps, 8 + num_dof + num_key_bodies * 3)
+
+
         # v6, align mocap
-        mimic_obs_buf = torch.cat((
+        mimic_obs_terms = [
             root_pos[..., 2:3], # 1 dim
             roll, pitch, yaw, # 3 dims
             root_vel, # 3 dims
             root_ang_vel[..., 2:3], # 1 dim, yaw only
             dof_pos, # num_dof dims
-        ), dim=-1)[:, 0:1] # shape: (num_envs, 1, 7 + num_dof)
-        
-        
+        ] # shape: (num_envs, num_steps, 8 + num_dof)
+
+        if self._obs_ref_root_pose:
+            # reference root pose relative to the robot's current root, in the robot's
+            # heading frame. Motion frames live in the motion-file frame; adding
+            # episode_init_origin maps them to the sim world (same convention as
+            # _update_ref_motion). Appended last so all legacy obs indices are unchanged.
+            ref_xy_world = root_pos[..., 0:2] + self.episode_init_origin[:, None, 0:2]
+            err_xy_world = ref_xy_world - self.root_states[:, None, 0:2]
+            # self.yaw is stale for envs reset this step, so recompute from root_states
+            _, _, robot_yaw = euler_from_quaternion(self.root_states[:, 3:7])
+            cos_yaw = torch.cos(robot_yaw)[:, None]
+            sin_yaw = torch.sin(robot_yaw)[:, None]
+            err_xy_local = torch.stack((
+                cos_yaw * err_xy_world[..., 0] + sin_yaw * err_xy_world[..., 1],
+                -sin_yaw * err_xy_world[..., 0] + cos_yaw * err_xy_world[..., 1],
+            ), dim=-1)
+            err_xy_local = torch.clamp(err_xy_local, -self._ref_root_pose_err_clip, self._ref_root_pose_err_clip)
+            yaw_diff = yaw - robot_yaw[:, None, None]
+            err_yaw = torch.atan2(torch.sin(yaw_diff), torch.cos(yaw_diff))
+            ref_root_pose_err = torch.cat((err_xy_local, err_yaw), dim=-1) # (num_envs, num_steps, 3)
+            priv_mimic_obs_terms.append(ref_root_pose_err) # 3 dims
+            mimic_obs_terms.append(ref_root_pose_err) # 3 dims
+
+        priv_mimic_obs_buf = torch.cat(priv_mimic_obs_terms, dim=-1)
+        mimic_obs_buf = torch.cat(mimic_obs_terms, dim=-1)[:, 0:1] # first target step only
+
         return priv_mimic_obs_buf.reshape(self.num_envs, -1), mimic_obs_buf.reshape(self.num_envs, -1)
 
     def compute_observations(self):

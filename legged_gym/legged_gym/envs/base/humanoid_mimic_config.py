@@ -15,6 +15,19 @@ class HumanoidMimicCfg(HumanoidCharCfg):
         global_obs = True
         track_root = True
         dof_err_w = None
+
+        # reference root pose observation (extension): feed the policy the reference
+        # root xy + yaw as an error relative to the robot's current root, expressed in
+        # the robot's heading frame (3 dims per target obs step). The robot has no
+        # observation of its own world xy/yaw, so an absolute reference would be
+        # uninformative; the error form matches the deploy-side odometry signal.
+        obs_ref_root_pose = False
+        ref_root_pose_err_clip = 1.0  # [m] clip on the xy error obs, keeps values in-distribution
+        # inject an initial robot-vs-reference pose error at reset so the policy sees
+        # nonzero errors to close (otherwise error only accrues from drift and pushes)
+        randomize_init_root_pose_err = False
+        init_root_xy_err_range = 0.15  # [m], uniform +-
+        init_root_yaw_err_range = 0.2  # [rad], uniform +-
         
 
 class HumanoidMimicCfgPPO(BaseConfig):
