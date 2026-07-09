@@ -113,6 +113,9 @@ def main(args, xml_file, robot_base):
 
     # 4. Loop over time steps and publish mimic obs
     control_dt = 0.02
+    # extension: pace playback slower than real time when the consumer (e.g. a
+    # rendering sim) cannot keep up; motion content is unchanged, only wall pacing
+    wall_dt = control_dt / args.real_time_factor
     # compute num_steps based on motion length
     motion_id = torch.tensor([0], device=device, dtype=torch.long)
     motion_length = motion_lib.get_motion_length(motion_id)
@@ -173,10 +176,10 @@ def main(args, xml_file, robot_base):
                 viewer.cam.distance = 2.0
                 viewer.sync()
                 
-            # Sleep to maintain real-time pace
+            # Sleep to maintain (scaled) real-time pace
             elapsed = time.time() - t0
-            if elapsed < control_dt:
-                time.sleep(control_dt - elapsed)
+            if elapsed < wall_dt:
+                time.sleep(wall_dt - elapsed)
         
     except KeyboardInterrupt:
         print("[Motion Server] Keyboard interrupt. Interpolating to default mimic_obs...")
@@ -188,7 +191,7 @@ def main(args, xml_file, robot_base):
             interp_mimic_obs = last_mimic_obs + (DEFAULT_MIMIC_OBS[args.robot] - last_mimic_obs) * (i / (time_back_to_default / control_dt))
             redis_client.set(f"action_mimic_{args.robot}", json.dumps(interp_mimic_obs.tolist()))
             redis_client.set(f"action_hand_{args.robot}", json.dumps(DEFAULT_ACTION_HAND[args.robot].tolist()))
-            time.sleep(control_dt)
+            time.sleep(wall_dt)
         redis_client.set(f"action_mimic_{args.robot}", json.dumps(DEFAULT_MIMIC_OBS[args.robot].tolist()))
         redis_client.set(f"action_hand_{args.robot}", json.dumps(DEFAULT_ACTION_HAND[args.robot].tolist()))
         last_mimic_obs = DEFAULT_MIMIC_OBS[args.robot]
@@ -203,7 +206,7 @@ def main(args, xml_file, robot_base):
             interp_mimic_obs = last_mimic_obs + (DEFAULT_MIMIC_OBS[args.robot] - last_mimic_obs) * (i / (time_back_to_default / control_dt))
             redis_client.set(f"action_mimic_{args.robot}", json.dumps(interp_mimic_obs.tolist()))
             redis_client.set(f"action_hand_{args.robot}", json.dumps(DEFAULT_ACTION_HAND[args.robot].tolist()))
-            time.sleep(control_dt)
+            time.sleep(wall_dt)
         redis_client.set(f"action_mimic_{args.robot}", json.dumps(DEFAULT_MIMIC_OBS[args.robot].tolist()))
         redis_client.set(f"action_hand_{args.robot}", json.dumps(DEFAULT_ACTION_HAND[args.robot].tolist()))
         last_mimic_obs = DEFAULT_MIMIC_OBS[args.robot]
@@ -219,6 +222,8 @@ if __name__ == "__main__":
                         default="1",
                         help="Comma-separated steps for future frames (tar_obs_steps)")
     parser.add_argument("--vis", action="store_true", help="Visualize the motion")
+    parser.add_argument("--real_time_factor", type=float, default=1.0,
+                        help="pace playback at this fraction of real time (sim2sim clock alignment when the sim runs below real time; keep 1.0 on hardware)")
     args = parser.parse_args()
 
     args.vis = True

@@ -76,12 +76,21 @@ class RealTimePolicyController:
                  policy_path,
                  device='cuda',
                  record_video=False,
+                 video_path="debug_sim.mp4",
+                 headless=False,
+                 sim_duration=100000.0,
+                 real_time_factor=1.0,
                  kp_recovery=0.0,
                  kp_yaw_recovery=0.0,
                  kd_recovery=0.0,
                  kd_yaw_recovery=0.0,
                  max_recovery_vel=0.5,
-                 max_recovery_yaw_rate=1.0):
+                 max_recovery_yaw_rate=1.0,
+                 log_recovery=None,
+                 push_force=0.0,
+                 push_time=2.0,
+                 push_duration=0.2,
+                 push_angle_deg=90.0):
 
         # extension: outer-loop global-trajectory recovery (Kp on world pose error,
         # injected through the mimic obs velocity / yaw-rate channels)
@@ -101,6 +110,20 @@ class RealTimePolicyController:
                   f"kd_pos={kd_recovery}, kd_yaw={kd_yaw_recovery}, "
                   f"max_vel={max_recovery_vel}, max_yaw_rate={max_recovery_yaw_rate}")
 
+        # extension: per-step global-tracking log (for data_utils/compare_recovery.py)
+        # and a scripted push, both timed relative to the first reference pose so
+        # baseline and recovery runs are comparable
+        self.log_recovery = log_recovery
+        self.recovery_log = [] if log_recovery is not None else None
+        self.push_force = push_force
+        self.push_time = push_time
+        self.push_duration = push_duration
+        self.push_angle = np.deg2rad(push_angle_deg)
+        self.motion_start_t = None  # sim time when the reference pose first appeared
+        if self.push_force != 0.0:
+            print(f"[Recovery] scripted push: {push_force} N for {push_duration}s "
+                  f"at t={push_time}s after motion start, direction {push_angle_deg} deg")
+
         self.redis_client = None
         try:
             self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
@@ -117,6 +140,7 @@ class RealTimePolicyController:
         self.model = mujoco.MjModel.from_xml_path(xml_file)
         self.model.opt.timestep = 0.001
         self.data = mujoco.MjData(self.model)
+        self.pelvis_body_id = self.model.body("pelvis").id
         
         # Print DoF names in order
         print("Degrees of Freedom (DoF) names and their order:")
@@ -135,17 +159,23 @@ class RealTimePolicyController:
             print(f"Motor ID {i}: {motor_name}")
             
 
-        self.viewer = mjv.launch_passive(self.model, self.data, show_left_ui=False, show_right_ui=False)
-        self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = 0
-        self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = 0
-        self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = 0
-        self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_COM] = 0
-        self.viewer.cam.distance = 2.0
+        if headless:
+            self.viewer = None
+        else:
+            self.viewer = mjv.launch_passive(self.model, self.data, show_left_ui=False, show_right_ui=False)
+            self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = 0
+            self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = 0
+            self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = 0
+            self.viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_COM] = 0
+            self.viewer.cam.distance = 2.0
 
         # Example defaults & placeholders
         self.num_actions = 23
-        self.sim_duration = 100000.0
+        self.sim_duration = sim_duration
         self.sim_dt = 0.001
+        # wall-clock budget per sim step; < 1.0 slows the sim so a motion server
+        # paced with the same factor stays in sync (sim2sim clock alignment)
+        self.wall_dt = self.sim_dt / real_time_factor
         self.sim_decimation = 20
 
         self.last_action = np.zeros(self.num_actions, dtype=np.float32)
@@ -211,6 +241,7 @@ class RealTimePolicyController:
             self.proprio_history_buf.append(np.zeros(self.n_proprio))
 
         self.record_video = record_video
+        self.video_path = video_path
 
     def extract_data(self):
         qpos = self.data.qpos.astype(np.float32)
@@ -243,6 +274,9 @@ class RealTimePolicyController:
         not need to share coordinates), then injects a clipped corrective velocity into
         mimic dims [4:6] (ref-local xy vel) and dim [7] (yaw rate). mimic layout:
         [0]=height, [1:4]=rpy, [4:7]=root vel, [7]=yaw rate, [8:33]=dof.
+
+        Also called with gains at 0 when --log_recovery or --push_force is set: the
+        pose error is computed and logged, but the command is left untouched.
         """
         ref_pose_json = self.redis_client.get("ref_root_pose_g1")
         if ref_pose_json is None:
@@ -258,6 +292,7 @@ class RealTimePolicyController:
         if self.recovery_anchor is None:
             dyaw = wrap_to_pi(robot_yaw - ref_yaw)
             self.recovery_anchor = (ref_xy.copy(), robot_xy.copy(), dyaw)
+            self.motion_start_t = t_sim
             print(f"[Recovery] anchored: dyaw={dyaw:.3f}, ref0={ref_xy}, robot0={robot_xy}")
 
         ref_xy0, robot_xy0, dyaw = self.recovery_anchor
@@ -291,10 +326,51 @@ class RealTimePolicyController:
                                 + self.kd_yaw_recovery * self.recovery_err_dot[2],
                                 -self.max_recovery_yaw_rate, self.max_recovery_yaw_rate)
 
-        action_mimic = action_mimic.copy()
-        action_mimic[4:6] += vel_corr_local
-        action_mimic[7] += yaw_rate_corr
+        if self.recovery_log is not None:
+            self.recovery_log.append([t_sim - self.motion_start_t,
+                                      target_xy[0], target_xy[1], robot_xy[0], robot_xy[1],
+                                      target_yaw, robot_yaw,
+                                      vel_corr_local[0], vel_corr_local[1], yaw_rate_corr])
+
+        if self.recovery_active:
+            action_mimic = action_mimic.copy()
+            action_mimic[4:6] += vel_corr_local
+            action_mimic[7] += yaw_rate_corr
         return action_mimic
+
+    def _apply_push(self, t_sim):
+        """Apply the scripted horizontal push to the pelvis inside its time window."""
+        if self.motion_start_t is None:
+            return
+        t_motion = t_sim - self.motion_start_t
+        if self.push_time <= t_motion < self.push_time + self.push_duration:
+            self.data.xfrc_applied[self.pelvis_body_id, 0] = self.push_force * np.cos(self.push_angle)
+            self.data.xfrc_applied[self.pelvis_body_id, 1] = self.push_force * np.sin(self.push_angle)
+        else:
+            self.data.xfrc_applied[self.pelvis_body_id, :3] = 0.0
+
+    def _save_recovery_log(self):
+        if self.recovery_log is None:
+            return
+        log_arr = np.array(self.recovery_log, dtype=np.float64).reshape(-1, 10)
+        log_path = os.path.abspath(self.log_recovery)
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        np.savez(log_path,
+                 data=log_arr,
+                 columns=np.array(["t", "target_x", "target_y", "robot_x", "robot_y",
+                                   "target_yaw", "robot_yaw",
+                                   "vel_corr_x", "vel_corr_y", "yaw_rate_corr"]),
+                 kp_recovery=self.kp_recovery,
+                 kp_yaw_recovery=self.kp_yaw_recovery,
+                 kd_recovery=self.kd_recovery,
+                 kd_yaw_recovery=self.kd_yaw_recovery,
+                 max_recovery_vel=self.max_recovery_vel,
+                 max_recovery_yaw_rate=self.max_recovery_yaw_rate,
+                 push_force=self.push_force,
+                 push_time=self.push_time,
+                 push_duration=self.push_duration,
+                 push_angle_deg=np.rad2deg(self.push_angle))
+        print(f"[Recovery] tracking log saved to {log_path} ({log_arr.shape[0]} steps)")
 
     def reset_sim(self):
         mujoco.mj_resetData(self.model, self.data)
@@ -306,12 +382,18 @@ class RealTimePolicyController:
         mujoco.mj_forward(self.model, self.data)
        
     def run(self):
-        # Optionally record video
+        # Optionally record video (offscreen renderer: the passive viewer has no
+        # read_pixels in mujoco >= 3)
         if self.record_video:
             import imageio
-            video_name = "debug_sim.mp4"
-            print(f"Saving video to {video_name}")
-            mp4_writer = imageio.get_writer(video_name, fps=50)
+            print(f"Saving video to {self.video_path}")
+            mp4_writer = imageio.get_writer(self.video_path, fps=50)
+            self.model.vis.global_.offwidth = max(self.model.vis.global_.offwidth, 1280)
+            self.model.vis.global_.offheight = max(self.model.vis.global_.offheight, 720)
+            renderer = mujoco.Renderer(self.model, height=720, width=1280)
+            record_cam = mujoco.MjvCamera()
+            record_cam.distance = 2.5
+            record_cam.elevation = -15
         else:
             mp4_writer = None
 
@@ -354,7 +436,7 @@ class RealTimePolicyController:
                         if action_mimic_json is not None:
                             action_mimic_list = json.loads(action_mimic_json)
                             action_mimic = np.array(action_mimic_list, dtype=np.float32)
-                            if self.recovery_active:
+                            if self.recovery_active or self.recovery_log is not None or self.push_force != 0.0:
                                 action_mimic = self._apply_global_recovery(action_mimic, rpy[2], i * self.sim_dt)
                             action_mimic, wrist_dof_pos = extract_mimic_obs_to_body_and_wrist(action_mimic)
                         else:
@@ -376,38 +458,46 @@ class RealTimePolicyController:
                     scaled_actions = raw_action * self.action_scale
                     pd_target = scaled_actions + self.default_dof_pos
                     pd_target = aggregate_wrist_dof_pos(pd_target, wrist_dof_pos)
-                    # debug draw velocity arrow if you want
-                    self.viewer.user_scn.ngeom = 0
-                    draw_root_velocity(self.model, self.data, self.viewer, [0,0,0], 0, "pelvis", [1,0,0,1])
-                    
-                    # make camera follow the pelvis
                     pelvis_pos = self.data.xpos[self.model.body("pelvis").id]
-                    self.viewer.cam.lookat = pelvis_pos
-                    self.viewer.sync()
+                    if self.viewer is not None:
+                        # debug draw velocity arrow if you want
+                        self.viewer.user_scn.ngeom = 0
+                        draw_root_velocity(self.model, self.data, self.viewer, [0,0,0], 0, "pelvis", [1,0,0,1])
+                        # make camera follow the pelvis
+                        self.viewer.cam.lookat = pelvis_pos
+                        self.viewer.sync()
                     if mp4_writer is not None:
-                        img = self.viewer.read_pixels()
-                        mp4_writer.append_data(img)
+                        record_cam.lookat = pelvis_pos
+                        renderer.update_scene(self.data, camera=record_cam)
+                        mp4_writer.append_data(renderer.render())
 
                 # PD control
                 torque = (pd_target - whole_body_dof) * self.stiffness - whole_body_dof_vel * self.damping
                 torque = np.clip(torque, -self.torque_limits, self.torque_limits)
-                
+
                 self.data.ctrl[:] = torque
-                
+
+                if self.push_force != 0.0:
+                    self._apply_push(i * self.sim_dt)
                 mujoco.mj_step(self.model, self.data)
-                # sleep to maintain real-time pace
+                # sleep to maintain (scaled) real-time pace
                 elapsed = time.time() - t_start
-                if elapsed < self.sim_dt:
-                    time.sleep(self.sim_dt - elapsed)
+                if elapsed < self.wall_dt:
+                    time.sleep(self.wall_dt - elapsed)
         except Exception as e:
             print(f"Error in run: {e}")
             pass
         finally:
+            # persist data before any GL teardown: a fatal X error in
+            # renderer/viewer close kills the process without unwinding Python
+            self._save_recovery_log()
             if mp4_writer is not None:
                 mp4_writer.close()
                 print("Video saved")
+                renderer.close()
 
-            self.viewer.close()
+            if self.viewer is not None:
+                self.viewer.close()
 
 
 def main_low_level_sim(args):
@@ -416,12 +506,21 @@ def main_low_level_sim(args):
         policy_path=args.policy_path,
         device='cuda',
         record_video=args.record_video,
+        video_path=args.video_path,
+        headless=args.headless,
+        sim_duration=args.sim_duration,
+        real_time_factor=args.real_time_factor,
         kp_recovery=args.kp_recovery,
         kp_yaw_recovery=args.kp_yaw_recovery,
         kd_recovery=args.kd_recovery,
         kd_yaw_recovery=args.kd_yaw_recovery,
         max_recovery_vel=args.max_recovery_vel,
         max_recovery_yaw_rate=args.max_recovery_yaw_rate,
+        log_recovery=args.log_recovery,
+        push_force=args.push_force,
+        push_time=args.push_time,
+        push_duration=args.push_duration,
+        push_angle_deg=args.push_angle,
     )
     controller.run()
 
@@ -437,6 +536,14 @@ if __name__ == "__main__":
                         )
                         
     parser.add_argument("--record_video", action="store_true", help="Record a video")
+    parser.add_argument("--video_path", type=str, default="debug_sim.mp4",
+                        help="output path for --record_video")
+    parser.add_argument("--headless", action="store_true",
+                        help="run without the interactive viewer window (scripted evals)")
+    parser.add_argument("--sim_duration", type=float, default=100000.0,
+                        help="stop the sim after this many sim-seconds (finite value = clean exit for scripted evals)")
+    parser.add_argument("--real_time_factor", type=float, default=1.0,
+                        help="pace the sim at this fraction of real time; pair with the same factor on the motion server when the sim cannot sustain 1.0")
 
     # extension: outer-loop global-trajectory recovery (0 = off, i.e. original behavior)
     parser.add_argument("--kp_recovery", type=float, default=0.0,
@@ -451,6 +558,20 @@ if __name__ == "__main__":
                         help="cap [m/s] on the corrective linear velocity")
     parser.add_argument("--max_recovery_yaw_rate", type=float, default=1.0,
                         help="cap [rad/s] on the corrective yaw rate")
+
+    # extension: evaluation tooling for A/B comparison (see data_utils/compare_recovery.py).
+    # Both need the patched motion server (it publishes ref_root_pose_g1); run one motion
+    # per sim run so the log has a single time axis.
+    parser.add_argument("--log_recovery", type=str, default=None,
+                        help="save a per-step global-tracking log to this .npz; also works with gains at 0 to record a baseline")
+    parser.add_argument("--push_force", type=float, default=0.0,
+                        help="scripted horizontal push on the pelvis [N] to induce drift (0 = no push)")
+    parser.add_argument("--push_time", type=float, default=2.0,
+                        help="push onset [s after the motion reference starts]")
+    parser.add_argument("--push_duration", type=float, default=0.2,
+                        help="push duration [s]")
+    parser.add_argument("--push_angle", type=float, default=90.0,
+                        help="push direction in the world xy plane [deg, 0 = +x, 90 = +y]")
     args = parser.parse_args()
 
     args.record_proprio = True
